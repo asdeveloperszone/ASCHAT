@@ -1,0 +1,852 @@
+import { auth, db } from './firebase-config.js';
+import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-auth.js";
+import { ref, push, onChildAdded, get, update, onValue, remove } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-database.js";
+import {
+  initCall,
+  startCall as _startCall,
+  acceptCall as _acceptCall,
+  declineCall as _declineCall,
+  endCall as _endCall,
+  toggleMute as _toggleMute,
+  toggleSpeaker as _toggleSpeaker,
+  toggleCamera as _toggleCamera,
+  setOnline
+} from './call.js';
+
+const params = new URLSearchParams(window.location.search);
+const otherID = params.get('id');
+const otherName = params.get('name');
+
+let myID = null;
+let chatKey = null;
+let renderedIDs = new Set();
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let activeMessageID = null;
+let activeMessageSenderID = null;
+let replyTo = null;
+let forwardMessageData = null;
+let analyserNode = null;
+let animationFrameID = null;
+const messageDataStore = {};
+const speeds = [1, 1.5, 2];
+const audioPlayers = {};
+const audioSpeeds = {};
+let waveformData = [];
+let waveformBars = [];
+
+onAuthStateChanged(auth, async (user) => {
+  if (!user) { window.location.href = 'auth.html'; return; }
+  myID = localStorage.getItem('aschat_userID');
+  chatKey = getChatKey(myID, otherID);
+  await setupHeader();
+  loadMessagesFromLocal();
+  syncFromFirebase();
+  listenForNewMessages();
+  markMessagesAsSeen();
+  listenToStatusUpdates();
+
+  // Init calls
+  setOnline(myID);
+  initCall(myID, otherID, otherName, () => {});
+});
+
+// ─── HEADER ────────────────────────────────────────────────
+async function setupHeader() {
+  document.getElementById('chatName').textContent = otherName;
+  const avatar = document.getElementById('chatAvatar');
+  const contacts = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
+  const contact = contacts[otherID];
+  if (contact && contact.photo) {
+    avatar.innerHTML = `<img src="${contact.photo}" class="chat-avatar-small-img" />`;
+  } else {
+    avatar.textContent = otherName.charAt(0).toUpperCase();
+    try {
+      const snap = await get(ref(db, 'users/' + otherID));
+      if (snap.exists() && snap.val().photoURL) {
+        avatar.innerHTML = `<img src="${snap.val().photoURL}" class="chat-avatar-small-img" />`;
+      }
+    } catch (err) { console.error(err); }
+  }
+}
+
+window.openOtherProfile = function () {
+  window.location.href = `other-profile.html?id=${otherID}&back=${encodeURIComponent('chat.html?id=' + otherID + '&name=' + encodeURIComponent(otherName))}`;
+}
+
+// ─── CALL CONTROLS ─────────────────────────────────────────
+window.startCall = (type) => _startCall(type);
+window.acceptCall = () => _acceptCall();
+window.declineCall = () => _declineCall();
+window.endCall = () => _endCall();
+window.toggleMute = () => _toggleMute();
+window.toggleSpeaker = () => _toggleSpeaker();
+window.toggleCamera = () => _toggleCamera();
+
+// ─── HELPERS ───────────────────────────────────────────────
+function getChatKey(id1, id2) { return [id1, id2].sort().join('_'); }
+
+function formatTime(timestamp) {
+  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function getTicks(status) {
+  if (status === 'sending') return `<span class="msg-ticks sending"><i class="fa-solid fa-clock"></i></span>`;
+  if (status === 'seen') return `<span class="msg-ticks seen">✓✓✓</span>`;
+  if (status === 'delivered') return `<span class="msg-ticks delivered">✓✓</span>`;
+  return `<span class="msg-ticks">✓</span>`;
+}
+
+// ─── LOAD FROM LOCAL ───────────────────────────────────────
+function loadMessagesFromLocal() {
+  const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
+  const messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+  messages.forEach(msg => {
+    if (deleted.includes(msg.id)) return;
+    if (!renderedIDs.has(msg.id)) {
+      renderedIDs.add(msg.id);
+      renderMessage(msg);
+    }
+  });
+  scrollToBottom();
+}
+
+// ─── SYNC FROM FIREBASE ────────────────────────────────────
+async function syncFromFirebase() {
+  try {
+    const snapshot = await get(ref(db, 'messages/' + chatKey));
+    if (!snapshot.exists()) return;
+    const data = snapshot.val();
+    const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
+
+    const allMessages = Object.entries(data).map(([key, val]) => ({
+      id: key,
+      text: val.text || null,
+      audio: val.audio || null,
+      photo: val.msgType === 'photo' ? val.photo : null,
+      msgType: val.msgType || 'text',
+      senderID: val.senderID,
+      status: val.status || 'sent',
+      reactions: val.reactions || {},
+      replyTo: val.replyTo || null,
+      forwarded: val.forwarded || false,
+      waveform: val.waveform || null,
+      callType: val.callType || null,
+      callStatus: val.callStatus || null,
+      timestamp: val.timestamp || Date.now(),
+      type: val.senderID === myID ? 'sent' : 'received'
+    }));
+
+    allMessages.sort((a, b) => a.timestamp - b.timestamp);
+    let localMessages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+    const localIDs = new Set(localMessages.map(m => m.id));
+
+    allMessages.forEach(msg => {
+      if (msg.msgType === 'photo') return;
+      if (deleted.includes(msg.id)) return;
+      if (!localIDs.has(msg.id)) localMessages.push(msg);
+      if (!renderedIDs.has(msg.id)) {
+        renderedIDs.add(msg.id);
+        renderMessage(msg);
+      }
+    });
+
+    localStorage.setItem('chat_' + chatKey, JSON.stringify(localMessages));
+    scrollToBottom();
+  } catch (err) { console.error('Sync error:', err); }
+}
+
+// ─── LISTEN FOR NEW MESSAGES ───────────────────────────────
+function listenForNewMessages() {
+  onChildAdded(ref(db, 'messages/' + chatKey), async (snapshot) => {
+    const msg = snapshot.val();
+    const msgID = snapshot.key;
+    const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
+    if (renderedIDs.has(msgID) || deleted.includes(msgID)) return;
+
+    const newMsg = {
+      id: msgID,
+      text: msg.text || null,
+      audio: msg.audio || null,
+      photo: msg.photo || null,
+      msgType: msg.msgType || 'text',
+      senderID: msg.senderID,
+      status: msg.status || 'sent',
+      reactions: msg.reactions || {},
+      replyTo: msg.replyTo || null,
+      forwarded: msg.forwarded || false,
+      waveform: msg.waveform || null,
+      callType: msg.callType || null,
+      callStatus: msg.callStatus || null,
+      timestamp: msg.timestamp || Date.now(),
+      type: msg.senderID === myID ? 'sent' : 'received'
+    };
+
+    renderedIDs.add(msgID);
+    if (newMsg.type === 'received' && newMsg.msgType !== 'call') {
+      await update(ref(db, 'messages/' + chatKey + '/' + msgID), { status: 'delivered' });
+      newMsg.status = 'delivered';
+    }
+
+    saveMessageToLocal(newMsg);
+    renderMessage(newMsg);
+    scrollToBottom();
+  });
+}
+
+// ─── MARK AS SEEN ──────────────────────────────────────────
+async function markMessagesAsSeen() {
+  try {
+    const snapshot = await get(ref(db, 'messages/' + chatKey));
+    if (!snapshot.exists()) return;
+    const data = snapshot.val();
+    const updates = {};
+    Object.entries(data).forEach(([key, val]) => {
+      if (val.receiverID === myID && val.status !== 'seen') updates[key + '/status'] = 'seen';
+    });
+    if (Object.keys(updates).length > 0) await update(ref(db, 'messages/' + chatKey), updates);
+    let unread = JSON.parse(localStorage.getItem('aschat_unread') || '{}');
+    unread[otherID] = 0;
+    localStorage.setItem('aschat_unread', JSON.stringify(unread));
+  } catch (err) { console.error('Mark seen error:', err); }
+}
+
+// ─── LIVE STATUS UPDATES ───────────────────────────────────
+function listenToStatusUpdates() {
+  onValue(ref(db, 'messages/' + chatKey), (snapshot) => {
+    const data = snapshot.exists() ? snapshot.val() : {};
+    const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
+
+    document.querySelectorAll('[data-id]').forEach(el => {
+      const msgID = el.getAttribute('data-id');
+      if (!data[msgID]) {
+        let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+        messages = messages.filter(m => m.id !== msgID);
+        localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+        renderedIDs.delete(msgID);
+        el.remove();
+        return;
+      }
+      if (deleted.includes(msgID)) return;
+      const val = data[msgID];
+
+      if (val.senderID === myID) {
+        const tickEl = el.querySelector('.msg-ticks');
+        if (tickEl) {
+          if (val.status === 'seen') { tickEl.className = 'msg-ticks seen'; tickEl.innerHTML = '✓✓✓'; }
+          else if (val.status === 'delivered') { tickEl.className = 'msg-ticks delivered'; tickEl.innerHTML = '✓✓'; }
+          else { tickEl.className = 'msg-ticks'; tickEl.innerHTML = '✓'; }
+        }
+      }
+      const reactionsEl = el.querySelector('.msg-reactions');
+      if (reactionsEl) reactionsEl.innerHTML = buildReactionsHTML(val.reactions || {});
+    });
+  });
+}
+
+// ─── REACTIONS ─────────────────────────────────────────────
+function buildReactionsHTML(reactions) {
+  if (!reactions || Object.keys(reactions).length === 0) return '';
+  const counts = {};
+  let myReaction = null;
+  Object.entries(reactions).forEach(([uid, emoji]) => {
+    counts[emoji] = (counts[emoji] || 0) + 1;
+    if (uid === myID) myReaction = emoji;
+  });
+  return Object.entries(counts).map(([emoji, count]) => `
+    <span class="msg-reaction-badge ${myReaction === emoji ? 'mine' : ''}">
+      ${emoji}<span class="count">${count > 1 ? count : ''}</span>
+    </span>
+  `).join('');
+}
+
+// ─── REPLY ─────────────────────────────────────────────────
+function buildReplyHTML(replyTo) {
+  if (!replyTo) return '';
+  const senderLabel = replyTo.senderID === myID ? 'You' : otherName;
+  let preview = replyTo.msgType === 'photo' ? '📷 Photo'
+    : replyTo.msgType === 'audio' ? '🎤 Voice message'
+    : replyTo.text || '';
+  return `<div class="reply-preview"><strong>${senderLabel}</strong>${preview}</div>`;
+}
+
+// ─── WAVEFORM ──────────────────────────────────────────────
+function buildWaveformHTML(waveformData) {
+  if (!waveformData || waveformData.length === 0) {
+    waveformData = Array.from({ length: 30 }, () => Math.random() * 0.8 + 0.1);
+  }
+  return waveformData.map((v, i) => {
+    const h = Math.max(4, Math.round(v * 28));
+    return `<div class="waveform-bar" data-index="${i}" style="height:${h}px;"></div>`;
+  }).join('');
+}
+
+// ─── SENDING PLACEHOLDER ───────────────────────────────────
+function renderSendingPlaceholder(type, tempID) {
+  const container = document.getElementById('messagesContainer');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'message-wrapper sent';
+  wrapper.setAttribute('data-temp-id', tempID);
+
+  const bubble = document.createElement('div');
+  bubble.className = 'message sent';
+
+  if (type === 'photo') {
+    bubble.innerHTML = `
+      <div class="sending-placeholder photo-placeholder">
+        <div class="sending-spinner"></div>
+        <span>Sending photo...</span>
+      </div>
+      <div class="msg-meta">
+        <span class="msg-time">${formatTime(Date.now())}</span>
+        ${getTicks('sending')}
+      </div>`;
+  } else if (type === 'audio') {
+    const fakeBars = Array.from({ length: 30 }, () =>
+      `<div class="waveform-bar sending-wave-bar" style="height:${Math.max(4, Math.round(Math.random() * 28))}px;"></div>`
+    ).join('');
+    bubble.innerHTML = `
+      <div class="voice-card">
+        <div class="voice-controls">
+          <button class="voice-play-btn" disabled style="opacity:0.5;">
+            <i class="fa-solid fa-play"></i>
+          </button>
+          <div class="waveform-container sending-waveform">${fakeBars}</div>
+        </div>
+        <div class="voice-bottom-row">
+          <span class="voice-duration" style="display:flex;align-items:center;gap:6px;">
+            <span class="sending-spinner" style="width:12px;height:12px;border-width:2px;"></span>
+            Sending...
+          </span>
+        </div>
+      </div>
+      <div class="msg-meta">
+        <span class="msg-time">${formatTime(Date.now())}</span>
+        ${getTicks('sending')}
+      </div>`;
+  }
+
+  wrapper.appendChild(bubble);
+  container.appendChild(wrapper);
+  scrollToBottom();
+}
+
+function removeSendingPlaceholder(tempID) {
+  const el = document.querySelector(`[data-temp-id="${tempID}"]`);
+  if (el) el.remove();
+}
+
+// ─── VOICE CARD ────────────────────────────────────────────
+function renderVoiceCard(msg) {
+  const waveHTML = buildWaveformHTML(msg.waveform || null);
+  return `
+    <div class="voice-card" id="voice_${msg.id}">
+      <div class="voice-controls">
+        <button class="voice-play-btn" id="playBtn_${msg.id}" onclick="togglePlay('${msg.id}')">
+          <i class="fa-solid fa-play"></i>
+        </button>
+        <div class="waveform-container" id="waveform_${msg.id}">${waveHTML}</div>
+      </div>
+      <div class="voice-bottom-row">
+        <span class="voice-duration" id="dur_${msg.id}">0:00</span>
+        <button class="voice-speed-btn" id="speed_${msg.id}" onclick="cycleSpeed('${msg.id}')">1x</button>
+      </div>
+      <audio id="audio_${msg.id}" src="${msg.audio}" style="display:none;"></audio>
+    </div>
+  `;
+}
+
+window.togglePlay = function (msgID) {
+  const audio = document.getElementById('audio_' + msgID);
+  const btn = document.getElementById('playBtn_' + msgID);
+  if (!audio) return;
+  if (audio.paused) {
+    Object.keys(audioPlayers).forEach(id => {
+      if (id !== msgID) {
+        audioPlayers[id].pause();
+        const b = document.getElementById('playBtn_' + id);
+        if (b) b.innerHTML = '<i class="fa-solid fa-play"></i>';
+      }
+    });
+    audio.play();
+    btn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+    audioPlayers[msgID] = audio;
+    audio.ontimeupdate = () => updateWaveformProgress(msgID, audio);
+    audio.onended = () => {
+      btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+      resetWaveform(msgID);
+    };
+  } else {
+    audio.pause();
+    btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+  }
+}
+
+function updateWaveformProgress(msgID, audio) {
+  const dur = document.getElementById('dur_' + msgID);
+  if (dur) {
+    const t = audio.currentTime;
+    const mins = Math.floor(t / 60);
+    const secs = Math.floor(t % 60).toString().padStart(2, '0');
+    dur.textContent = `${mins}:${secs}`;
+  }
+  const container = document.getElementById('waveform_' + msgID);
+  if (!container || !audio.duration) return;
+  const bars = container.querySelectorAll('.waveform-bar');
+  const progress = audio.currentTime / audio.duration;
+  const playedCount = Math.floor(progress * bars.length);
+  bars.forEach((bar, i) => bar.classList.toggle('played', i < playedCount));
+}
+
+function resetWaveform(msgID) {
+  const container = document.getElementById('waveform_' + msgID);
+  if (container) container.querySelectorAll('.waveform-bar').forEach(b => b.classList.remove('played'));
+  const dur = document.getElementById('dur_' + msgID);
+  if (dur) dur.textContent = '0:00';
+}
+
+window.cycleSpeed = function (msgID) {
+  const audio = document.getElementById('audio_' + msgID);
+  const btn = document.getElementById('speed_' + msgID);
+  if (!audio || !btn) return;
+  const currentIdx = audioSpeeds[msgID] || 0;
+  const nextIdx = (currentIdx + 1) % speeds.length;
+  audioSpeeds[msgID] = nextIdx;
+  audio.playbackRate = speeds[nextIdx];
+  btn.textContent = speeds[nextIdx] + 'x';
+}
+
+// ─── BOTTOM SHEET ──────────────────────────────────────────
+window.openBottomSheet = function (msgID) {
+  const msg = messageDataStore[msgID];
+  if (!msg) return;
+  activeMessageID = msgID;
+  activeMessageSenderID = msg.senderID;
+
+  const spans = document.getElementById('reactionPicker').querySelectorAll('span');
+  spans.forEach(s => s.classList.remove('selected'));
+  get(ref(db, 'messages/' + chatKey + '/' + msgID + '/reactions/' + myID)).then(snap => {
+    if (snap.exists()) {
+      spans.forEach(s => { if (s.textContent.trim() === snap.val()) s.classList.add('selected'); });
+    }
+  });
+
+  const actions = document.getElementById('sheetActions');
+  actions.innerHTML = '';
+
+  if (msg.msgType !== 'call') {
+    const replyBtn = document.createElement('button');
+    replyBtn.className = 'sheet-btn';
+    replyBtn.innerHTML = `<i class="fa-solid fa-reply"></i> Reply`;
+    replyBtn.onclick = () => startReply(msg);
+    actions.appendChild(replyBtn);
+
+    const forwardBtn = document.createElement('button');
+    forwardBtn.className = 'sheet-btn';
+    forwardBtn.innerHTML = `<i class="fa-solid fa-share"></i> Forward`;
+    forwardBtn.onclick = () => startForward(msg);
+    actions.appendChild(forwardBtn);
+  }
+
+  const deleteMe = document.createElement('button');
+  deleteMe.className = 'sheet-btn danger';
+  deleteMe.innerHTML = `<i class="fa-solid fa-trash"></i> Delete for me`;
+  deleteMe.onclick = () => deleteForMe(msgID);
+  actions.appendChild(deleteMe);
+
+  if (msg.senderID === myID) {
+    const deleteAll = document.createElement('button');
+    deleteAll.className = 'sheet-btn danger';
+    deleteAll.innerHTML = `<i class="fa-solid fa-trash-can"></i> Delete for everyone`;
+    deleteAll.onclick = () => deleteForEveryone(msgID);
+    actions.appendChild(deleteAll);
+  }
+
+  document.getElementById('bottomSheet').style.display = 'flex';
+}
+
+window.closeBottomSheet = function () {
+  document.getElementById('bottomSheet').style.display = 'none';
+  activeMessageID = null;
+  activeMessageSenderID = null;
+}
+
+window.closeSheet = function (e) {
+  if (e.target === document.getElementById('bottomSheet')) closeBottomSheet();
+}
+
+window.reactToMessage = async function (emoji) {
+  if (!activeMessageID) return;
+  try {
+    const reactionRef = ref(db, 'messages/' + chatKey + '/' + activeMessageID + '/reactions/' + myID);
+    const snap = await get(reactionRef);
+    if (snap.exists() && snap.val() === emoji) await remove(reactionRef);
+    else await update(ref(db, 'messages/' + chatKey + '/' + activeMessageID + '/reactions'), { [myID]: emoji });
+  } catch (err) { console.error('Reaction error:', err); }
+  closeBottomSheet();
+}
+
+// ─── REPLY ─────────────────────────────────────────────────
+function startReply(msg) {
+  replyTo = { msgID: msg.id, senderID: msg.senderID, text: msg.text, msgType: msg.msgType };
+  const senderLabel = msg.senderID === myID ? 'You' : otherName;
+  let preview = msg.msgType === 'photo' ? '📷 Photo'
+    : msg.msgType === 'audio' ? '🎤 Voice message'
+    : msg.text || '';
+  document.getElementById('replyBarName').textContent = senderLabel;
+  document.getElementById('replyBarText').textContent = preview;
+  document.getElementById('replyBar').classList.add('active');
+  document.getElementById('messageInput').focus();
+  closeBottomSheet();
+}
+
+window.cancelReply = function () {
+  replyTo = null;
+  document.getElementById('replyBar').classList.remove('active');
+}
+
+// ─── FORWARD ───────────────────────────────────────────────
+function startForward(msg) {
+  forwardMessageData = msg;
+  const contacts = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
+  const list = document.getElementById('forwardContactsList');
+  list.innerHTML = '';
+  const others = Object.values(contacts).filter(c => c.userID !== otherID);
+  if (others.length === 0) {
+    list.innerHTML = '<p style="color:#aaa;text-align:center;font-size:13px;padding:20px 0;">No other contacts.</p>';
+  } else {
+    others.forEach(contact => {
+      const item = document.createElement('div');
+      item.className = 'forward-contact';
+      const avatarHTML = contact.photo
+        ? `<img src="${contact.photo}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" />`
+        : `<div class="forward-avatar">${contact.name.charAt(0).toUpperCase()}</div>`;
+      item.innerHTML = `${avatarHTML}<span class="forward-contact-name">${contact.name}</span>`;
+      item.onclick = () => forwardToContact(contact);
+      list.appendChild(item);
+    });
+  }
+  closeBottomSheet();
+  document.getElementById('forwardModal').style.display = 'flex';
+}
+
+window.closeForwardModal = function () {
+  document.getElementById('forwardModal').style.display = 'none';
+  forwardMessageData = null;
+}
+
+async function forwardToContact(contact) {
+  if (!forwardMessageData) return;
+  const fwdChatKey = getChatKey(myID, contact.userID);
+  try {
+    const payload = {
+      msgType: forwardMessageData.msgType, senderID: myID,
+      receiverID: contact.userID, status: 'sent',
+      timestamp: Date.now(), forwarded: true
+    };
+    if (forwardMessageData.msgType === 'photo') payload.photo = forwardMessageData.photo;
+    else if (forwardMessageData.msgType === 'audio') {
+      payload.audio = forwardMessageData.audio;
+      payload.waveform = forwardMessageData.waveform || null;
+    } else payload.text = forwardMessageData.text;
+
+    const newRef = await push(ref(db, 'messages/' + fwdChatKey), payload);
+    const fwdMsg = { ...payload, id: newRef.key, type: 'sent' };
+    let fwdMessages = JSON.parse(localStorage.getItem('chat_' + fwdChatKey) || '[]');
+    fwdMessages.push(fwdMsg);
+    localStorage.setItem('chat_' + fwdChatKey, JSON.stringify(fwdMessages));
+
+    let contacts2 = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
+    if (!contacts2[contact.userID]) {
+      contacts2[contact.userID] = { name: contact.name, userID: contact.userID };
+      localStorage.setItem('aschat_contacts', JSON.stringify(contacts2));
+    }
+    closeForwardModal();
+    alert(`Forwarded to ${contact.name}!`);
+  } catch (err) { alert('Failed to forward.'); }
+}
+
+// ─── DELETE ────────────────────────────────────────────────
+async function deleteForMe(msgID) {
+  let deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
+  if (!deleted.includes(msgID)) deleted.push(msgID);
+  localStorage.setItem('deleted_forme_' + chatKey, JSON.stringify(deleted));
+  let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+  messages = messages.filter(m => m.id !== msgID);
+  localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+  renderedIDs.delete(msgID);
+  const el = document.querySelector(`[data-id="${msgID}"]`);
+  if (el) el.remove();
+  closeBottomSheet();
+}
+
+async function deleteForEveryone(msgID) {
+  try {
+    await remove(ref(db, 'messages/' + chatKey + '/' + msgID));
+    let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+    messages = messages.filter(m => m.id !== msgID);
+    localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+    renderedIDs.delete(msgID);
+    const el = document.querySelector(`[data-id="${msgID}"]`);
+    if (el) el.remove();
+  } catch (err) { console.error('Delete everyone error:', err); }
+  closeBottomSheet();
+}
+
+// ─── SEND TEXT ─────────────────────────────────────────────
+window.sendMessage = async function () {
+  const input = document.getElementById('messageInput');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  const payload = {
+    text, msgType: 'text', senderID: myID,
+    receiverID: otherID, status: 'sent', timestamp: Date.now()
+  };
+  if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+  try {
+    const newRef = await push(ref(db, 'messages/' + chatKey), payload);
+    const msg = { ...payload, id: newRef.key, type: 'sent' };
+    saveMessageToLocal(msg);
+    if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
+  } catch (err) { alert('Failed to send.'); }
+}
+
+// ─── SEND PHOTO ────────────────────────────────────────────
+window.sendPhoto = async function (event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const tempID = 'temp_' + Date.now();
+  renderSendingPlaceholder('photo', tempID);
+  const reader = new FileReader();
+  reader.onload = async function (e) {
+    const base64 = e.target.result;
+    const payload = {
+      photo: base64, msgType: 'photo', senderID: myID,
+      receiverID: otherID, status: 'sent', timestamp: Date.now()
+    };
+    if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+    try {
+      const newRef = await push(ref(db, 'messages/' + chatKey), payload);
+      const msg = { ...payload, id: newRef.key, type: 'sent' };
+      saveMessageToLocal(msg);
+      removeSendingPlaceholder(tempID);
+      if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
+    } catch (err) { removeSendingPlaceholder(tempID); alert('Failed to send photo.'); }
+  };
+  reader.readAsDataURL(file);
+  event.target.value = '';
+}
+
+// ─── VOICE RECORDING ───────────────────────────────────────
+window.startRecording = async function (e) {
+  e.preventDefault();
+  if (isRecording) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const source = audioCtx.createMediaStreamSource(stream);
+    analyserNode = audioCtx.createAnalyser();
+    analyserNode.fftSize = 64;
+    source.connect(analyserNode);
+
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+    waveformData = [];
+    isRecording = true;
+
+    const btn = document.getElementById('voiceBtn');
+    btn.classList.add('recording');
+    btn.innerHTML = '<i class="fa-solid fa-stop"></i>';
+
+    const recWave = document.getElementById('recordingWaveform');
+    recWave.classList.add('active');
+    recWave.innerHTML = '';
+    waveformBars = [];
+    for (let i = 0; i < 20; i++) {
+      const bar = document.createElement('div');
+      bar.className = 'recording-bar';
+      recWave.appendChild(bar);
+      waveformBars.push(bar);
+    }
+    document.getElementById('messageInput').style.display = 'none';
+
+    const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+    function animateBars() {
+      if (!isRecording) return;
+      analyserNode.getByteFrequencyData(dataArray);
+      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+      const normalized = avg / 255;
+      waveformData.push(normalized);
+      waveformBars.forEach((bar, i) => {
+        const offset = waveformData.length - waveformBars.length + i;
+        const val = offset >= 0 && waveformData[offset] ? waveformData[offset] : 0.05;
+        const h = Math.max(4, Math.round(val * 28));
+        bar.style.height = h + 'px';
+      });
+      animationFrameID = requestAnimationFrame(animateBars);
+    }
+    animateBars();
+
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.start();
+  } catch (err) { alert('Microphone access denied.'); }
+}
+
+window.stopRecording = async function (e) {
+  e.preventDefault();
+  if (!isRecording || !mediaRecorder) return;
+  isRecording = false;
+  cancelAnimationFrame(animationFrameID);
+
+  const btn = document.getElementById('voiceBtn');
+  btn.classList.remove('recording');
+  btn.innerHTML = '<i class="fa-solid fa-microphone"></i>';
+
+  document.getElementById('recordingWaveform').classList.remove('active');
+  document.getElementById('messageInput').style.display = '';
+
+  const capturedWaveform = [...waveformData];
+  const tempID = 'temp_' + Date.now();
+  renderSendingPlaceholder('audio', tempID);
+
+  mediaRecorder.stop();
+  mediaRecorder.onstop = async () => {
+    if (audioChunks.length === 0) { removeSendingPlaceholder(tempID); return; }
+    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+    if (audioBlob.size < 1000) {
+      removeSendingPlaceholder(tempID);
+      mediaRecorder.stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = async function (e) {
+      const base64 = e.target.result;
+      const sampled = sampleWaveform(capturedWaveform, 40);
+      const payload = {
+        audio: base64, msgType: 'audio', senderID: myID,
+        receiverID: otherID, status: 'sent',
+        waveform: sampled, timestamp: Date.now()
+      };
+      if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+      try {
+        const newRef = await push(ref(db, 'messages/' + chatKey), payload);
+        const msg = { ...payload, id: newRef.key, type: 'sent' };
+        saveMessageToLocal(msg);
+        removeSendingPlaceholder(tempID);
+        if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
+      } catch (err) { removeSendingPlaceholder(tempID); alert('Failed to send voice message.'); }
+    };
+    reader.readAsDataURL(audioBlob);
+    mediaRecorder.stream.getTracks().forEach(t => t.stop());
+  };
+}
+
+function sampleWaveform(data, maxPoints) {
+  if (data.length <= maxPoints) return data;
+  const step = data.length / maxPoints;
+  return Array.from({ length: maxPoints }, (_, i) => data[Math.floor(i * step)]);
+}
+
+window.cancelRecording = function () {
+  if (!isRecording || !mediaRecorder) return;
+  isRecording = false;
+  cancelAnimationFrame(animationFrameID);
+  audioChunks = [];
+  const btn = document.getElementById('voiceBtn');
+  btn.classList.remove('recording');
+  btn.innerHTML = '<i class="fa-solid fa-microphone"></i>';
+  document.getElementById('recordingWaveform').classList.remove('active');
+  document.getElementById('messageInput').style.display = '';
+  mediaRecorder.stop();
+  mediaRecorder.onstop = () => { mediaRecorder.stream.getTracks().forEach(t => t.stop()); };
+}
+
+// ─── SAVE TO LOCAL ─────────────────────────────────────────
+function saveMessageToLocal(msg) {
+  let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+  if (!messages.find(m => m.id === msg.id)) {
+    messages.push(msg);
+    localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+  }
+}
+
+// ─── RENDER MESSAGE ────────────────────────────────────────
+function renderMessage(msg) {
+  const container = document.getElementById('messagesContainer');
+  messageDataStore[msg.id] = msg;
+
+  const wrapper = document.createElement('div');
+  wrapper.className = `message-wrapper ${msg.type === 'sent' ? 'sent' : 'received'}`;
+  wrapper.setAttribute('data-id', msg.id);
+
+  const isSent = msg.type === 'sent';
+  const ticksHTML = isSent ? getTicks(msg.status || 'sent') : '';
+  const reactionsHTML = buildReactionsHTML(msg.reactions || {});
+  const replyHTML = msg.replyTo ? buildReplyHTML(msg.replyTo) : '';
+  const forwardedHTML = msg.forwarded
+    ? `<div style="font-size:11px;color:#888;margin-bottom:3px;"><i class="fa-solid fa-share" style="font-size:10px;"></i> Forwarded</div>`
+    : '';
+
+  let msgContent = '';
+  if (msg.msgType === 'photo' && msg.photo) {
+    msgContent = `<img src="${msg.photo}" class="msg-photo" onclick="openPhoto(this.src)" />`;
+  } else if (msg.msgType === 'audio' && msg.audio) {
+    msgContent = renderVoiceCard(msg);
+  } else if (msg.msgType === 'call') {
+    const isMissed = msg.callStatus === 'missed';
+    const isDeclined = msg.callStatus === 'declined';
+    const iconClass = msg.callType === 'video' ? 'fa-video' : 'fa-phone';
+    const color = (isMissed || isDeclined) ? '#e53935' : '#128C7E';
+    msgContent = `
+      <div class="call-msg-bubble ${isMissed ? 'missed' : ''}">
+        <i class="fa-solid ${iconClass}" style="color:${color};"></i>
+        <span>${msg.text}</span>
+      </div>`;
+  } else {
+    msgContent = `<div>${msg.text}</div>`;
+  }
+
+  const bubble = document.createElement('div');
+  bubble.className = `message ${isSent ? 'sent' : 'received'}`;
+  bubble.innerHTML = `
+    ${forwardedHTML}
+    ${replyHTML}
+    ${msgContent}
+    <div class="msg-meta">
+      <span class="msg-time">${formatTime(msg.timestamp)}</span>
+      ${ticksHTML}
+    </div>
+    <div class="msg-reactions">${reactionsHTML}</div>
+  `;
+
+  const actionBtn = document.createElement('button');
+  actionBtn.className = 'msg-action-btn';
+  actionBtn.innerHTML = '<i class="fa-solid fa-ellipsis-vertical"></i>';
+  actionBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openBottomSheet(msg.id);
+  });
+
+  wrapper.appendChild(bubble);
+  wrapper.appendChild(actionBtn);
+  container.appendChild(wrapper);
+}
+
+// ─── PHOTO VIEWER ──────────────────────────────────────────
+window.openPhoto = function (src) {
+  document.getElementById('photoModalImg').src = src;
+  document.getElementById('photoModal').style.display = 'flex';
+}
+
+window.closePhoto = function () {
+  document.getElementById('photoModal').style.display = 'none';
+  document.getElementById('photoModalImg').src = '';
+}
+
+// ─── SCROLL ────────────────────────────────────────────────
+function scrollToBottom() {
+  const container = document.getElementById('messagesContainer');
+  container.scrollTop = container.scrollHeight;
+}

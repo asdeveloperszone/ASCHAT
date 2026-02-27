@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ASChat - Login</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body class="auth-page">
+
+  <div class="auth-container">
+    <div class="auth-logo">💬</div>
+    <h2>ASChat</h2>
+
+    <!-- Tabs -->
+    <div class="auth-tabs">
+      <button class="tab-btn active" id="loginTab" onclick="showLogin()">Login</button>
+      <button class="tab-btn" id="registerTab" onclick="showRegister()">Register</button>
+    </div>
+
+    <!-- Login Form -->
+    <div id="loginForm">
+      <input type="email" id="loginEmail" placeholder="Email" />
+      <input type="password" id="loginPassword" placeholder="Password" />
+      <button class="btn-primary" onclick="loginUser()">Login</button>
+    </div>
+
+    <!-- Register Form -->
+    <div id="registerForm" style="display:none;">
+      <input type="text" id="registerName" placeholder="Display Name" />
+      <input type="email" id="registerEmail" placeholder="Email" />
+      <input type="password" id="registerPassword" placeholder="Password" />
+      <button class="btn-primary" onclick="registerUser()">Create Account</button>
+    </div>
+
+    <div class="divider">or</div>
+
+    <!-- Google Sign In -->
+    <button class="btn-google" onclick="loginWithGoogle()">
+      <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" width="20"/>
+      Continue with Google
+    </button>
+
+    <p id="authError" class="error-msg"></p>
+  </div>
+
+  <script type="module" src="js/auth.js"></script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ASChat - Chats</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+</head>
+<body class="chats-page">
+
+  <div class="chats-header">
+    <h2>ASChat</h2>
+    <div class="header-actions">
+      <button onclick="window.location.href='profile.html'" title="My Profile">
+        <i class="fa-solid fa-user-circle"></i>
+      </button>
+      <button onclick="showAddUser()" title="New Chat">
+        <i class="fa-solid fa-plus"></i>
+      </button>
+      <button onclick="logoutUser()" title="Logout">
+        <i class="fa-solid fa-right-from-bracket"></i>
+      </button>
+    </div>
+  </div>
+
+  <div class="my-id-banner">
+    <span>Your ID: <strong id="myIDDisplay">Loading...</strong></span>
+    <button onclick="copyID()" class="copy-btn">Copy</button>
+  </div>
+
+  <div id="addUserModal" class="modal" style="display:none;">
+    <div class="modal-box">
+      <h3>New Chat</h3>
+      <p>Enter the 9-digit ID of the user</p>
+      <input type="text" id="searchID" placeholder="123456789" maxlength="9" />
+      <p id="searchError" class="error-msg"></p>
+      <div class="modal-actions">
+        <button onclick="hideAddUser()" class="btn-cancel">Cancel</button>
+        <button onclick="searchUser()" class="btn-primary">Start Chat</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="chats-list" id="chatsList">
+    <p class="no-chats">No chats yet. Add someone to start!</p>
+  </div>
+
+  <script type="module" src="js/chats.js"></script>
+</body>
+</html>

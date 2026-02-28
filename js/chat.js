@@ -1,6 +1,6 @@
 import { auth, db } from './firebase-config.js';
 import { onAuthStateChanged } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-auth.js";
-import { ref, push, onChildAdded, get, update, onValue, remove } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-database.js";
+import { ref, push, onChildAdded, get, update, onValue, remove, runTransaction } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-database.js";
 import {
   initCall,
   startCall as _startCall,
@@ -13,11 +13,14 @@ import {
   setOnline
 } from './call.js';
 
+// Get URL parameters
 const params = new URLSearchParams(window.location.search);
 const otherID = params.get('id');
 const otherName = params.get('name');
 
+// Global variables
 let myID = null;
+let myUID = null;
 let chatKey = null;
 let renderedIDs = new Set();
 let mediaRecorder = null;
@@ -36,9 +39,35 @@ const audioSpeeds = {};
 let waveformData = [];
 let waveformBars = [];
 
+// Check authentication
 onAuthStateChanged(auth, async (user) => {
-  if (!user) { window.location.href = 'auth.html'; return; }
+  if (!user) { 
+    window.location.href = 'auth.html'; 
+    return; 
+  }
+  
+  myUID = user.uid;
   myID = localStorage.getItem('aschat_userID');
+  
+  if (!myID || myID === 'null') {
+    // Try to load from Firebase
+    try {
+      const snapshot = await get(ref(db, 'userMap/' + myUID));
+      if (snapshot.exists()) {
+        myID = snapshot.val();
+        localStorage.setItem('aschat_userID', myID);
+      } else {
+        console.error('No user ID found');
+        window.location.href = 'auth.html';
+        return;
+      }
+    } catch (err) {
+      console.error('Error loading user ID:', err);
+      window.location.href = 'auth.html';
+      return;
+    }
+  }
+  
   chatKey = getChatKey(myID, otherID);
   await setupHeader();
   loadMessagesFromLocal();
@@ -46,36 +75,106 @@ onAuthStateChanged(auth, async (user) => {
   listenForNewMessages();
   markMessagesAsSeen();
   listenToStatusUpdates();
+  listenToPresence();
 
-  // Init calls
+  // Initialize calls
   setOnline(myID);
   initCall(myID, otherID, otherName, () => {});
 });
 
-// ─── HEADER ────────────────────────────────────────────────
+// ─── HELPER FUNCTIONS ────────────────────────────────────────────────
+
+function getChatKey(id1, id2) { 
+  return [id1, id2].sort().join('_'); 
+}
+
+function formatTime(timestamp) {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  
+  if (isToday) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+  return date.toLocaleDateString([], { day: '2-digit', month: '2-digit' });
+}
+
+function getTicks(status) {
+  if (status === 'sending') {
+    return `<span class="msg-ticks sending"><i class="fa-solid fa-clock"></i></span>`;
+  }
+  if (status === 'seen') {
+    return `<span class="msg-ticks seen">✓✓</span>`;
+  }
+  if (status === 'delivered') {
+    return `<span class="msg-ticks delivered">✓✓</span>`;
+  }
+  return `<span class="msg-ticks">✓</span>`;
+}
+
+function scrollToBottom() {
+  const container = document.getElementById('messagesContainer');
+  if (container) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+// ─── HEADER SETUP ────────────────────────────────────────────────
+
 async function setupHeader() {
   document.getElementById('chatName').textContent = otherName;
+  
   const avatar = document.getElementById('chatAvatar');
   const contacts = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
   const contact = contacts[otherID];
+  
   if (contact && contact.photo) {
     avatar.innerHTML = `<img src="${contact.photo}" class="chat-avatar-small-img" />`;
   } else {
     avatar.textContent = otherName.charAt(0).toUpperCase();
+    
     try {
       const snap = await get(ref(db, 'users/' + otherID));
       if (snap.exists() && snap.val().photoURL) {
         avatar.innerHTML = `<img src="${snap.val().photoURL}" class="chat-avatar-small-img" />`;
+        
+        // Update contacts cache
+        if (contact) {
+          contact.photo = snap.val().photoURL;
+          localStorage.setItem('aschat_contacts', JSON.stringify(contacts));
+        }
       }
-    } catch (err) { console.error(err); }
+    } catch (err) { 
+      console.error('Error loading avatar:', err); 
+    }
   }
 }
 
-window.openOtherProfile = function () {
-  window.location.href = `other-profile.html?id=${otherID}&back=${encodeURIComponent('chat.html?id=' + otherID + '&name=' + encodeURIComponent(otherName))}`;
+// ─── PRESENCE LISTENER ────────────────────────────────────────────────
+
+function listenToPresence() {
+  const presenceRef = ref(db, 'presence/' + otherID);
+  onValue(presenceRef, (snapshot) => {
+    const statusEl = document.getElementById('chatStatus');
+    if (!statusEl) return;
+    
+    if (snapshot.exists() && snapshot.val() === 'online') {
+      statusEl.textContent = 'online';
+      statusEl.style.color = '#25D366';
+    } else {
+      statusEl.textContent = 'offline';
+      statusEl.style.color = 'rgba(255,255,255,0.75)';
+    }
+  });
 }
 
 // ─── CALL CONTROLS ─────────────────────────────────────────
+
+window.openOtherProfile = function () {
+  const backURL = encodeURIComponent('chat.html?id=' + otherID + '&name=' + encodeURIComponent(otherName));
+  window.location.href = `other-profile.html?id=${otherID}&back=${backURL}`;
+}
+
 window.startCall = (type) => _startCall(type);
 window.acceptCall = () => _acceptCall();
 window.declineCall = () => _declineCall();
@@ -84,24 +183,12 @@ window.toggleMute = () => _toggleMute();
 window.toggleSpeaker = () => _toggleSpeaker();
 window.toggleCamera = () => _toggleCamera();
 
-// ─── HELPERS ───────────────────────────────────────────────
-function getChatKey(id1, id2) { return [id1, id2].sort().join('_'); }
+// ─── LOAD MESSAGES FROM LOCAL STORAGE ───────────────────────────────────────
 
-function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function getTicks(status) {
-  if (status === 'sending') return `<span class="msg-ticks sending"><i class="fa-solid fa-clock"></i></span>`;
-  if (status === 'seen') return `<span class="msg-ticks seen">✓✓✓</span>`;
-  if (status === 'delivered') return `<span class="msg-ticks delivered">✓✓</span>`;
-  return `<span class="msg-ticks">✓</span>`;
-}
-
-// ─── LOAD FROM LOCAL ───────────────────────────────────────
 function loadMessagesFromLocal() {
   const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
   const messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+  
   messages.forEach(msg => {
     if (deleted.includes(msg.id)) return;
     if (!renderedIDs.has(msg.id)) {
@@ -109,14 +196,17 @@ function loadMessagesFromLocal() {
       renderMessage(msg);
     }
   });
+  
   scrollToBottom();
 }
 
 // ─── SYNC FROM FIREBASE ────────────────────────────────────
+
 async function syncFromFirebase() {
   try {
     const snapshot = await get(ref(db, 'messages/' + chatKey));
     if (!snapshot.exists()) return;
+    
     const data = snapshot.val();
     const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
 
@@ -139,13 +229,16 @@ async function syncFromFirebase() {
     }));
 
     allMessages.sort((a, b) => a.timestamp - b.timestamp);
+    
     let localMessages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
     const localIDs = new Set(localMessages.map(m => m.id));
 
     allMessages.forEach(msg => {
-      if (msg.msgType === 'photo') return;
+      if (msg.msgType === 'photo') return; // Photos handled separately
       if (deleted.includes(msg.id)) return;
-      if (!localIDs.has(msg.id)) localMessages.push(msg);
+      if (!localIDs.has(msg.id)) {
+        localMessages.push(msg);
+      }
       if (!renderedIDs.has(msg.id)) {
         renderedIDs.add(msg.id);
         renderMessage(msg);
@@ -154,14 +247,22 @@ async function syncFromFirebase() {
 
     localStorage.setItem('chat_' + chatKey, JSON.stringify(localMessages));
     scrollToBottom();
-  } catch (err) { console.error('Sync error:', err); }
+  } catch (err) { 
+    console.error('Sync error:', err); 
+  }
 }
 
 // ─── LISTEN FOR NEW MESSAGES ───────────────────────────────
+
 function listenForNewMessages() {
-  onChildAdded(ref(db, 'messages/' + chatKey), async (snapshot) => {
+  const messagesRef = ref(db, 'messages/' + chatKey);
+  
+  onChildAdded(messagesRef, async (snapshot) => {
     const msg = snapshot.val();
     const msgID = snapshot.key;
+    
+    if (!msg) return;
+    
     const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
     if (renderedIDs.has(msgID) || deleted.includes(msgID)) return;
 
@@ -184,9 +285,17 @@ function listenForNewMessages() {
     };
 
     renderedIDs.add(msgID);
+    
+    // Update status for received messages
     if (newMsg.type === 'received' && newMsg.msgType !== 'call') {
-      await update(ref(db, 'messages/' + chatKey + '/' + msgID), { status: 'delivered' });
-      newMsg.status = 'delivered';
+      try {
+        await update(ref(db, 'messages/' + chatKey + '/' + msgID), { 
+          status: 'delivered' 
+        });
+        newMsg.status = 'delivered';
+      } catch (err) {
+        console.error('Error updating message status:', err);
+      }
     }
 
     saveMessageToLocal(newMsg);
@@ -195,32 +304,51 @@ function listenForNewMessages() {
   });
 }
 
-// ─── MARK AS SEEN ──────────────────────────────────────────
+// ─── MARK MESSAGES AS SEEN ──────────────────────────────────────────
+
 async function markMessagesAsSeen() {
   try {
     const snapshot = await get(ref(db, 'messages/' + chatKey));
     if (!snapshot.exists()) return;
+    
     const data = snapshot.val();
     const updates = {};
+    let hasUpdates = false;
+    
     Object.entries(data).forEach(([key, val]) => {
-      if (val.receiverID === myID && val.status !== 'seen') updates[key + '/status'] = 'seen';
+      if (val.receiverID === myID && val.status !== 'seen') {
+        updates[key + '/status'] = 'seen';
+        hasUpdates = true;
+      }
     });
-    if (Object.keys(updates).length > 0) await update(ref(db, 'messages/' + chatKey), updates);
+    
+    if (hasUpdates) {
+      await update(ref(db, 'messages/' + chatKey), updates);
+    }
+    
+    // Clear unread count
     let unread = JSON.parse(localStorage.getItem('aschat_unread') || '{}');
     unread[otherID] = 0;
     localStorage.setItem('aschat_unread', JSON.stringify(unread));
-  } catch (err) { console.error('Mark seen error:', err); }
+  } catch (err) { 
+    console.error('Mark seen error:', err); 
+  }
 }
 
 // ─── LIVE STATUS UPDATES ───────────────────────────────────
+
 function listenToStatusUpdates() {
-  onValue(ref(db, 'messages/' + chatKey), (snapshot) => {
+  const messagesRef = ref(db, 'messages/' + chatKey);
+  
+  onValue(messagesRef, (snapshot) => {
     const data = snapshot.exists() ? snapshot.val() : {};
     const deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
 
     document.querySelectorAll('[data-id]').forEach(el => {
       const msgID = el.getAttribute('data-id');
+      
       if (!data[msgID]) {
+        // Message was deleted
         let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
         messages = messages.filter(m => m.id !== msgID);
         localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
@@ -228,32 +356,50 @@ function listenToStatusUpdates() {
         el.remove();
         return;
       }
+      
       if (deleted.includes(msgID)) return;
+      
       const val = data[msgID];
 
+      // Update ticks
       if (val.senderID === myID) {
         const tickEl = el.querySelector('.msg-ticks');
         if (tickEl) {
-          if (val.status === 'seen') { tickEl.className = 'msg-ticks seen'; tickEl.innerHTML = '✓✓✓'; }
-          else if (val.status === 'delivered') { tickEl.className = 'msg-ticks delivered'; tickEl.innerHTML = '✓✓'; }
-          else { tickEl.className = 'msg-ticks'; tickEl.innerHTML = '✓'; }
+          if (val.status === 'seen') { 
+            tickEl.className = 'msg-ticks seen'; 
+            tickEl.innerHTML = '✓✓';
+          } else if (val.status === 'delivered') { 
+            tickEl.className = 'msg-ticks delivered'; 
+            tickEl.innerHTML = '✓✓';
+          } else { 
+            tickEl.className = 'msg-ticks'; 
+            tickEl.innerHTML = '✓';
+          }
         }
       }
+      
+      // Update reactions
       const reactionsEl = el.querySelector('.msg-reactions');
-      if (reactionsEl) reactionsEl.innerHTML = buildReactionsHTML(val.reactions || {});
+      if (reactionsEl) {
+        reactionsEl.innerHTML = buildReactionsHTML(val.reactions || {});
+      }
     });
   });
 }
 
 // ─── REACTIONS ─────────────────────────────────────────────
+
 function buildReactionsHTML(reactions) {
   if (!reactions || Object.keys(reactions).length === 0) return '';
+  
   const counts = {};
   let myReaction = null;
+  
   Object.entries(reactions).forEach(([uid, emoji]) => {
     counts[emoji] = (counts[emoji] || 0) + 1;
     if (uid === myID) myReaction = emoji;
   });
+  
   return Object.entries(counts).map(([emoji, count]) => `
     <span class="msg-reaction-badge ${myReaction === emoji ? 'mine' : ''}">
       ${emoji}<span class="count">${count > 1 ? count : ''}</span>
@@ -261,28 +407,143 @@ function buildReactionsHTML(reactions) {
   `).join('');
 }
 
-// ─── REPLY ─────────────────────────────────────────────────
+// ─── REPLY PREVIEW ─────────────────────────────────────────────────
+
 function buildReplyHTML(replyTo) {
   if (!replyTo) return '';
+  
   const senderLabel = replyTo.senderID === myID ? 'You' : otherName;
-  let preview = replyTo.msgType === 'photo' ? '📷 Photo'
-    : replyTo.msgType === 'audio' ? '🎤 Voice message'
-    : replyTo.text || '';
-  return `<div class="reply-preview"><strong>${senderLabel}</strong>${preview}</div>`;
+  let preview = '';
+  
+  if (replyTo.msgType === 'photo') {
+    preview = '📷 Photo';
+  } else if (replyTo.msgType === 'audio') {
+    preview = '🎤 Voice message';
+  } else {
+    preview = replyTo.text || '';
+  }
+  
+  return `<div class="reply-preview"><strong>${senderLabel}</strong> ${preview}</div>`;
 }
 
 // ─── WAVEFORM ──────────────────────────────────────────────
+
 function buildWaveformHTML(waveformData) {
   if (!waveformData || waveformData.length === 0) {
     waveformData = Array.from({ length: 30 }, () => Math.random() * 0.8 + 0.1);
   }
+  
   return waveformData.map((v, i) => {
     const h = Math.max(4, Math.round(v * 28));
     return `<div class="waveform-bar" data-index="${i}" style="height:${h}px;"></div>`;
   }).join('');
 }
 
+function sampleWaveform(data, maxPoints) {
+  if (data.length <= maxPoints) return data;
+  const step = data.length / maxPoints;
+  return Array.from({ length: maxPoints }, (_, i) => data[Math.floor(i * step)]);
+}
+
+// ─── VOICE CARD ────────────────────────────────────────────
+
+function renderVoiceCard(msg) {
+  const waveHTML = buildWaveformHTML(msg.waveform || null);
+  
+  return `
+    <div class="voice-card" id="voice_${msg.id}">
+      <div class="voice-controls">
+        <button class="voice-play-btn" id="playBtn_${msg.id}" onclick="togglePlay('${msg.id}')">
+          <i class="fa-solid fa-play"></i>
+        </button>
+        <div class="waveform-container" id="waveform_${msg.id}">${waveHTML}</div>
+      </div>
+      <div class="voice-bottom-row">
+        <span class="voice-duration" id="dur_${msg.id}">0:00</span>
+        <button class="voice-speed-btn" id="speed_${msg.id}" onclick="cycleSpeed('${msg.id}')">1x</button>
+      </div>
+      <audio id="audio_${msg.id}" src="${msg.audio}" style="display:none;"></audio>
+    </div>
+  `;
+}
+
+// Voice playback functions (make them global)
+window.togglePlay = function (msgID) {
+  const audio = document.getElementById('audio_' + msgID);
+  const btn = document.getElementById('playBtn_' + msgID);
+  
+  if (!audio) return;
+  
+  if (audio.paused) {
+    // Pause any other playing audio
+    Object.keys(audioPlayers).forEach(id => {
+      if (id !== msgID) {
+        audioPlayers[id].pause();
+        const b = document.getElementById('playBtn_' + id);
+        if (b) b.innerHTML = '<i class="fa-solid fa-play"></i>';
+      }
+    });
+    
+    audio.play();
+    btn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+    audioPlayers[msgID] = audio;
+    
+    audio.ontimeupdate = () => updateWaveformProgress(msgID, audio);
+    audio.onended = () => {
+      btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+      resetWaveform(msgID);
+    };
+  } else {
+    audio.pause();
+    btn.innerHTML = '<i class="fa-solid fa-play"></i>';
+  }
+}
+
+function updateWaveformProgress(msgID, audio) {
+  const dur = document.getElementById('dur_' + msgID);
+  if (dur) {
+    const t = audio.currentTime;
+    const mins = Math.floor(t / 60);
+    const secs = Math.floor(t % 60).toString().padStart(2, '0');
+    dur.textContent = `${mins}:${secs}`;
+  }
+  
+  const container = document.getElementById('waveform_' + msgID);
+  if (!container || !audio.duration) return;
+  
+  const bars = container.querySelectorAll('.waveform-bar');
+  const progress = audio.currentTime / audio.duration;
+  const playedCount = Math.floor(progress * bars.length);
+  
+  bars.forEach((bar, i) => {
+    bar.classList.toggle('played', i < playedCount);
+  });
+}
+
+function resetWaveform(msgID) {
+  const container = document.getElementById('waveform_' + msgID);
+  if (container) {
+    container.querySelectorAll('.waveform-bar').forEach(b => b.classList.remove('played'));
+  }
+  const dur = document.getElementById('dur_' + msgID);
+  if (dur) dur.textContent = '0:00';
+}
+
+window.cycleSpeed = function (msgID) {
+  const audio = document.getElementById('audio_' + msgID);
+  const btn = document.getElementById('speed_' + msgID);
+  
+  if (!audio || !btn) return;
+  
+  const currentIdx = audioSpeeds[msgID] || 0;
+  const nextIdx = (currentIdx + 1) % speeds.length;
+  audioSpeeds[msgID] = nextIdx;
+  audio.playbackRate = speeds[nextIdx];
+  btn.textContent = speeds[nextIdx] + 'x';
+}
+
 // ─── SENDING PLACEHOLDER ───────────────────────────────────
+
 function renderSendingPlaceholder(type, tempID) {
   const container = document.getElementById('messagesContainer');
   const wrapper = document.createElement('div');
@@ -306,6 +567,7 @@ function renderSendingPlaceholder(type, tempID) {
     const fakeBars = Array.from({ length: 30 }, () =>
       `<div class="waveform-bar sending-wave-bar" style="height:${Math.max(4, Math.round(Math.random() * 28))}px;"></div>`
     ).join('');
+    
     bubble.innerHTML = `
       <div class="voice-card">
         <div class="voice-controls">
@@ -337,101 +599,30 @@ function removeSendingPlaceholder(tempID) {
   if (el) el.remove();
 }
 
-// ─── VOICE CARD ────────────────────────────────────────────
-function renderVoiceCard(msg) {
-  const waveHTML = buildWaveformHTML(msg.waveform || null);
-  return `
-    <div class="voice-card" id="voice_${msg.id}">
-      <div class="voice-controls">
-        <button class="voice-play-btn" id="playBtn_${msg.id}" onclick="togglePlay('${msg.id}')">
-          <i class="fa-solid fa-play"></i>
-        </button>
-        <div class="waveform-container" id="waveform_${msg.id}">${waveHTML}</div>
-      </div>
-      <div class="voice-bottom-row">
-        <span class="voice-duration" id="dur_${msg.id}">0:00</span>
-        <button class="voice-speed-btn" id="speed_${msg.id}" onclick="cycleSpeed('${msg.id}')">1x</button>
-      </div>
-      <audio id="audio_${msg.id}" src="${msg.audio}" style="display:none;"></audio>
-    </div>
-  `;
-}
-
-window.togglePlay = function (msgID) {
-  const audio = document.getElementById('audio_' + msgID);
-  const btn = document.getElementById('playBtn_' + msgID);
-  if (!audio) return;
-  if (audio.paused) {
-    Object.keys(audioPlayers).forEach(id => {
-      if (id !== msgID) {
-        audioPlayers[id].pause();
-        const b = document.getElementById('playBtn_' + id);
-        if (b) b.innerHTML = '<i class="fa-solid fa-play"></i>';
-      }
-    });
-    audio.play();
-    btn.innerHTML = '<i class="fa-solid fa-pause"></i>';
-    audioPlayers[msgID] = audio;
-    audio.ontimeupdate = () => updateWaveformProgress(msgID, audio);
-    audio.onended = () => {
-      btn.innerHTML = '<i class="fa-solid fa-play"></i>';
-      resetWaveform(msgID);
-    };
-  } else {
-    audio.pause();
-    btn.innerHTML = '<i class="fa-solid fa-play"></i>';
-  }
-}
-
-function updateWaveformProgress(msgID, audio) {
-  const dur = document.getElementById('dur_' + msgID);
-  if (dur) {
-    const t = audio.currentTime;
-    const mins = Math.floor(t / 60);
-    const secs = Math.floor(t % 60).toString().padStart(2, '0');
-    dur.textContent = `${mins}:${secs}`;
-  }
-  const container = document.getElementById('waveform_' + msgID);
-  if (!container || !audio.duration) return;
-  const bars = container.querySelectorAll('.waveform-bar');
-  const progress = audio.currentTime / audio.duration;
-  const playedCount = Math.floor(progress * bars.length);
-  bars.forEach((bar, i) => bar.classList.toggle('played', i < playedCount));
-}
-
-function resetWaveform(msgID) {
-  const container = document.getElementById('waveform_' + msgID);
-  if (container) container.querySelectorAll('.waveform-bar').forEach(b => b.classList.remove('played'));
-  const dur = document.getElementById('dur_' + msgID);
-  if (dur) dur.textContent = '0:00';
-}
-
-window.cycleSpeed = function (msgID) {
-  const audio = document.getElementById('audio_' + msgID);
-  const btn = document.getElementById('speed_' + msgID);
-  if (!audio || !btn) return;
-  const currentIdx = audioSpeeds[msgID] || 0;
-  const nextIdx = (currentIdx + 1) % speeds.length;
-  audioSpeeds[msgID] = nextIdx;
-  audio.playbackRate = speeds[nextIdx];
-  btn.textContent = speeds[nextIdx] + 'x';
-}
-
 // ─── BOTTOM SHEET ──────────────────────────────────────────
+
 window.openBottomSheet = function (msgID) {
   const msg = messageDataStore[msgID];
   if (!msg) return;
+  
   activeMessageID = msgID;
   activeMessageSenderID = msg.senderID;
 
+  // Highlight selected reaction
   const spans = document.getElementById('reactionPicker').querySelectorAll('span');
   spans.forEach(s => s.classList.remove('selected'));
+  
   get(ref(db, 'messages/' + chatKey + '/' + msgID + '/reactions/' + myID)).then(snap => {
     if (snap.exists()) {
-      spans.forEach(s => { if (s.textContent.trim() === snap.val()) s.classList.add('selected'); });
+      spans.forEach(s => { 
+        if (s.textContent.trim() === snap.val()) {
+          s.classList.add('selected');
+        }
+      });
     }
   });
 
+  // Build action buttons
   const actions = document.getElementById('sheetActions');
   actions.innerHTML = '';
 
@@ -473,27 +664,53 @@ window.closeBottomSheet = function () {
 }
 
 window.closeSheet = function (e) {
-  if (e.target === document.getElementById('bottomSheet')) closeBottomSheet();
+  if (e.target === document.getElementById('bottomSheet')) {
+    closeBottomSheet();
+  }
 }
 
 window.reactToMessage = async function (emoji) {
   if (!activeMessageID) return;
+  
   try {
     const reactionRef = ref(db, 'messages/' + chatKey + '/' + activeMessageID + '/reactions/' + myID);
     const snap = await get(reactionRef);
-    if (snap.exists() && snap.val() === emoji) await remove(reactionRef);
-    else await update(ref(db, 'messages/' + chatKey + '/' + activeMessageID + '/reactions'), { [myID]: emoji });
-  } catch (err) { console.error('Reaction error:', err); }
+    
+    if (snap.exists() && snap.val() === emoji) {
+      await remove(reactionRef);
+    } else {
+      await update(ref(db, 'messages/' + chatKey + '/' + activeMessageID + '/reactions'), { 
+        [myID]: emoji 
+      });
+    }
+  } catch (err) { 
+    console.error('Reaction error:', err); 
+  }
+  
   closeBottomSheet();
 }
 
 // ─── REPLY ─────────────────────────────────────────────────
+
 function startReply(msg) {
-  replyTo = { msgID: msg.id, senderID: msg.senderID, text: msg.text, msgType: msg.msgType };
+  replyTo = { 
+    msgID: msg.id, 
+    senderID: msg.senderID, 
+    text: msg.text, 
+    msgType: msg.msgType 
+  };
+  
   const senderLabel = msg.senderID === myID ? 'You' : otherName;
-  let preview = msg.msgType === 'photo' ? '📷 Photo'
-    : msg.msgType === 'audio' ? '🎤 Voice message'
-    : msg.text || '';
+  let preview = '';
+  
+  if (msg.msgType === 'photo') {
+    preview = '📷 Photo';
+  } else if (msg.msgType === 'audio') {
+    preview = '🎤 Voice message';
+  } else {
+    preview = msg.text || '';
+  }
+  
   document.getElementById('replyBarName').textContent = senderLabel;
   document.getElementById('replyBarText').textContent = preview;
   document.getElementById('replyBar').classList.add('active');
@@ -507,26 +724,33 @@ window.cancelReply = function () {
 }
 
 // ─── FORWARD ───────────────────────────────────────────────
+
 function startForward(msg) {
   forwardMessageData = msg;
+  
   const contacts = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
   const list = document.getElementById('forwardContactsList');
   list.innerHTML = '';
+  
   const others = Object.values(contacts).filter(c => c.userID !== otherID);
+  
   if (others.length === 0) {
     list.innerHTML = '<p style="color:#aaa;text-align:center;font-size:13px;padding:20px 0;">No other contacts.</p>';
   } else {
     others.forEach(contact => {
       const item = document.createElement('div');
       item.className = 'forward-contact';
+      
       const avatarHTML = contact.photo
         ? `<img src="${contact.photo}" style="width:40px;height:40px;border-radius:50%;object-fit:cover;" />`
         : `<div class="forward-avatar">${contact.name.charAt(0).toUpperCase()}</div>`;
+      
       item.innerHTML = `${avatarHTML}<span class="forward-contact-name">${contact.name}</span>`;
       item.onclick = () => forwardToContact(contact);
       list.appendChild(item);
     });
   }
+  
   closeBottomSheet();
   document.getElementById('forwardModal').style.display = 'flex';
 }
@@ -538,113 +762,211 @@ window.closeForwardModal = function () {
 
 async function forwardToContact(contact) {
   if (!forwardMessageData) return;
+  
   const fwdChatKey = getChatKey(myID, contact.userID);
+  
   try {
     const payload = {
-      msgType: forwardMessageData.msgType, senderID: myID,
-      receiverID: contact.userID, status: 'sent',
-      timestamp: Date.now(), forwarded: true
+      msgType: forwardMessageData.msgType,
+      senderID: myID,
+      receiverID: contact.userID,
+      status: 'sent',
+      timestamp: Date.now(),
+      forwarded: true
     };
-    if (forwardMessageData.msgType === 'photo') payload.photo = forwardMessageData.photo;
-    else if (forwardMessageData.msgType === 'audio') {
+    
+    if (forwardMessageData.msgType === 'photo') {
+      payload.photo = forwardMessageData.photo;
+    } else if (forwardMessageData.msgType === 'audio') {
       payload.audio = forwardMessageData.audio;
       payload.waveform = forwardMessageData.waveform || null;
-    } else payload.text = forwardMessageData.text;
+    } else {
+      payload.text = forwardMessageData.text;
+    }
 
     const newRef = await push(ref(db, 'messages/' + fwdChatKey), payload);
-    const fwdMsg = { ...payload, id: newRef.key, type: 'sent' };
+    
+    const fwdMsg = { 
+      ...payload, 
+      id: newRef.key, 
+      type: 'sent' 
+    };
+    
     let fwdMessages = JSON.parse(localStorage.getItem('chat_' + fwdChatKey) || '[]');
     fwdMessages.push(fwdMsg);
     localStorage.setItem('chat_' + fwdChatKey, JSON.stringify(fwdMessages));
 
     let contacts2 = JSON.parse(localStorage.getItem('aschat_contacts') || '{}');
     if (!contacts2[contact.userID]) {
-      contacts2[contact.userID] = { name: contact.name, userID: contact.userID };
+      contacts2[contact.userID] = { 
+        name: contact.name, 
+        userID: contact.userID,
+        photo: contact.photo || null
+      };
       localStorage.setItem('aschat_contacts', JSON.stringify(contacts2));
     }
+    
     closeForwardModal();
-    alert(`Forwarded to ${contact.name}!`);
-  } catch (err) { alert('Failed to forward.'); }
+    alert(`Message forwarded to ${contact.name}!`);
+  } catch (err) { 
+    console.error('Forward error:', err);
+    alert('Failed to forward message.'); 
+  }
 }
 
 // ─── DELETE ────────────────────────────────────────────────
+
 async function deleteForMe(msgID) {
   let deleted = JSON.parse(localStorage.getItem('deleted_forme_' + chatKey) || '[]');
-  if (!deleted.includes(msgID)) deleted.push(msgID);
-  localStorage.setItem('deleted_forme_' + chatKey, JSON.stringify(deleted));
+  if (!deleted.includes(msgID)) {
+    deleted.push(msgID);
+    localStorage.setItem('deleted_forme_' + chatKey, JSON.stringify(deleted));
+  }
+  
   let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
   messages = messages.filter(m => m.id !== msgID);
   localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+  
   renderedIDs.delete(msgID);
   const el = document.querySelector(`[data-id="${msgID}"]`);
   if (el) el.remove();
+  
   closeBottomSheet();
 }
 
 async function deleteForEveryone(msgID) {
   try {
     await remove(ref(db, 'messages/' + chatKey + '/' + msgID));
+    
     let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
     messages = messages.filter(m => m.id !== msgID);
     localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
+    
     renderedIDs.delete(msgID);
     const el = document.querySelector(`[data-id="${msgID}"]`);
     if (el) el.remove();
-  } catch (err) { console.error('Delete everyone error:', err); }
+  } catch (err) { 
+    console.error('Delete everyone error:', err); 
+  }
+  
   closeBottomSheet();
 }
 
 // ─── SEND TEXT ─────────────────────────────────────────────
+
 window.sendMessage = async function () {
   const input = document.getElementById('messageInput');
   const text = input.value.trim();
+  
   if (!text) return;
+  
   input.value = '';
+  
   const payload = {
-    text, msgType: 'text', senderID: myID,
-    receiverID: otherID, status: 'sent', timestamp: Date.now()
+    text: text,
+    msgType: 'text',
+    senderID: myID,
+    receiverID: otherID,
+    status: 'sent',
+    timestamp: Date.now()
   };
-  if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+  
+  if (replyTo) {
+    payload.replyTo = replyTo;
+    cancelReply();
+  }
+  
   try {
     const newRef = await push(ref(db, 'messages/' + chatKey), payload);
-    const msg = { ...payload, id: newRef.key, type: 'sent' };
+    const msg = { 
+      ...payload, 
+      id: newRef.key, 
+      type: 'sent' 
+    };
+    
     saveMessageToLocal(msg);
-    if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
-  } catch (err) { alert('Failed to send.'); }
+    
+    if (!renderedIDs.has(msg.id)) {
+      renderedIDs.add(msg.id);
+      renderMessage(msg);
+      scrollToBottom();
+    }
+  } catch (err) { 
+    console.error('Send error:', err);
+    alert('Failed to send message.'); 
+  }
 }
 
 // ─── SEND PHOTO ────────────────────────────────────────────
+
 window.sendPhoto = async function (event) {
   const file = event.target.files[0];
   if (!file) return;
+  
+  // Validate file size (max 5MB)
+  if (file.size > 5 * 1024 * 1024) {
+    alert('Photo too large. Max 5MB.');
+    return;
+  }
+  
   const tempID = 'temp_' + Date.now();
   renderSendingPlaceholder('photo', tempID);
+  
   const reader = new FileReader();
   reader.onload = async function (e) {
     const base64 = e.target.result;
+    
     const payload = {
-      photo: base64, msgType: 'photo', senderID: myID,
-      receiverID: otherID, status: 'sent', timestamp: Date.now()
+      photo: base64,
+      msgType: 'photo',
+      senderID: myID,
+      receiverID: otherID,
+      status: 'sent',
+      timestamp: Date.now()
     };
-    if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+    
+    if (replyTo) {
+      payload.replyTo = replyTo;
+      cancelReply();
+    }
+    
     try {
       const newRef = await push(ref(db, 'messages/' + chatKey), payload);
-      const msg = { ...payload, id: newRef.key, type: 'sent' };
+      const msg = { 
+        ...payload, 
+        id: newRef.key, 
+        type: 'sent' 
+      };
+      
       saveMessageToLocal(msg);
       removeSendingPlaceholder(tempID);
-      if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
-    } catch (err) { removeSendingPlaceholder(tempID); alert('Failed to send photo.'); }
+      
+      if (!renderedIDs.has(msg.id)) {
+        renderedIDs.add(msg.id);
+        renderMessage(msg);
+        scrollToBottom();
+      }
+    } catch (err) { 
+      removeSendingPlaceholder(tempID); 
+      console.error('Photo send error:', err);
+      alert('Failed to send photo.'); 
+    }
   };
+  
   reader.readAsDataURL(file);
   event.target.value = '';
 }
 
 // ─── VOICE RECORDING ───────────────────────────────────────
+
 window.startRecording = async function (e) {
   e.preventDefault();
+  
   if (isRecording) return;
+  
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     const source = audioCtx.createMediaStreamSource(stream);
     analyserNode = audioCtx.createAnalyser();
@@ -664,39 +986,54 @@ window.startRecording = async function (e) {
     recWave.classList.add('active');
     recWave.innerHTML = '';
     waveformBars = [];
+    
     for (let i = 0; i < 20; i++) {
       const bar = document.createElement('div');
       bar.className = 'recording-bar';
       recWave.appendChild(bar);
       waveformBars.push(bar);
     }
+    
     document.getElementById('messageInput').style.display = 'none';
 
     const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+    
     function animateBars() {
       if (!isRecording) return;
+      
       analyserNode.getByteFrequencyData(dataArray);
       const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
       const normalized = avg / 255;
       waveformData.push(normalized);
+      
       waveformBars.forEach((bar, i) => {
         const offset = waveformData.length - waveformBars.length + i;
         const val = offset >= 0 && waveformData[offset] ? waveformData[offset] : 0.05;
         const h = Math.max(4, Math.round(val * 28));
         bar.style.height = h + 'px';
       });
+      
       animationFrameID = requestAnimationFrame(animateBars);
     }
+    
     animateBars();
 
-    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+    mediaRecorder.ondataavailable = (e) => { 
+      if (e.data.size > 0) audioChunks.push(e.data); 
+    };
+    
     mediaRecorder.start();
-  } catch (err) { alert('Microphone access denied.'); }
+  } catch (err) { 
+    console.error('Recording error:', err);
+    alert('Microphone access denied.'); 
+  }
 }
 
 window.stopRecording = async function (e) {
   e.preventDefault();
+  
   if (!isRecording || !mediaRecorder) return;
+  
   isRecording = false;
   cancelAnimationFrame(animationFrameID);
 
@@ -712,60 +1049,95 @@ window.stopRecording = async function (e) {
   renderSendingPlaceholder('audio', tempID);
 
   mediaRecorder.stop();
+  
   mediaRecorder.onstop = async () => {
-    if (audioChunks.length === 0) { removeSendingPlaceholder(tempID); return; }
+    if (audioChunks.length === 0) { 
+      removeSendingPlaceholder(tempID); 
+      mediaRecorder.stream.getTracks().forEach(t => t.stop());
+      return; 
+    }
+    
     const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+    
     if (audioBlob.size < 1000) {
       removeSendingPlaceholder(tempID);
       mediaRecorder.stream.getTracks().forEach(t => t.stop());
       return;
     }
+    
     const reader = new FileReader();
     reader.onload = async function (e) {
       const base64 = e.target.result;
       const sampled = sampleWaveform(capturedWaveform, 40);
+      
       const payload = {
-        audio: base64, msgType: 'audio', senderID: myID,
-        receiverID: otherID, status: 'sent',
-        waveform: sampled, timestamp: Date.now()
+        audio: base64,
+        msgType: 'audio',
+        senderID: myID,
+        receiverID: otherID,
+        status: 'sent',
+        waveform: sampled,
+        timestamp: Date.now()
       };
-      if (replyTo) { payload.replyTo = replyTo; cancelReply(); }
+      
+      if (replyTo) {
+        payload.replyTo = replyTo;
+        cancelReply();
+      }
+      
       try {
         const newRef = await push(ref(db, 'messages/' + chatKey), payload);
-        const msg = { ...payload, id: newRef.key, type: 'sent' };
+        const msg = { 
+          ...payload, 
+          id: newRef.key, 
+          type: 'sent' 
+        };
+        
         saveMessageToLocal(msg);
         removeSendingPlaceholder(tempID);
-        if (!renderedIDs.has(msg.id)) { renderedIDs.add(msg.id); renderMessage(msg); scrollToBottom(); }
-      } catch (err) { removeSendingPlaceholder(tempID); alert('Failed to send voice message.'); }
+        
+        if (!renderedIDs.has(msg.id)) {
+          renderedIDs.add(msg.id);
+          renderMessage(msg);
+          scrollToBottom();
+        }
+      } catch (err) { 
+        removeSendingPlaceholder(tempID); 
+        console.error('Voice send error:', err);
+        alert('Failed to send voice message.'); 
+      }
     };
+    
     reader.readAsDataURL(audioBlob);
     mediaRecorder.stream.getTracks().forEach(t => t.stop());
   };
 }
 
-function sampleWaveform(data, maxPoints) {
-  if (data.length <= maxPoints) return data;
-  const step = data.length / maxPoints;
-  return Array.from({ length: maxPoints }, (_, i) => data[Math.floor(i * step)]);
-}
-
 window.cancelRecording = function () {
   if (!isRecording || !mediaRecorder) return;
+  
   isRecording = false;
   cancelAnimationFrame(animationFrameID);
   audioChunks = [];
+  
   const btn = document.getElementById('voiceBtn');
   btn.classList.remove('recording');
   btn.innerHTML = '<i class="fa-solid fa-microphone"></i>';
+  
   document.getElementById('recordingWaveform').classList.remove('active');
   document.getElementById('messageInput').style.display = '';
+  
   mediaRecorder.stop();
-  mediaRecorder.onstop = () => { mediaRecorder.stream.getTracks().forEach(t => t.stop()); };
+  mediaRecorder.onstop = () => { 
+    mediaRecorder.stream.getTracks().forEach(t => t.stop()); 
+  };
 }
 
 // ─── SAVE TO LOCAL ─────────────────────────────────────────
+
 function saveMessageToLocal(msg) {
   let messages = JSON.parse(localStorage.getItem('chat_' + chatKey) || '[]');
+  
   if (!messages.find(m => m.id === msg.id)) {
     messages.push(msg);
     localStorage.setItem('chat_' + chatKey, JSON.stringify(messages));
@@ -773,8 +1145,11 @@ function saveMessageToLocal(msg) {
 }
 
 // ─── RENDER MESSAGE ────────────────────────────────────────
+
 function renderMessage(msg) {
   const container = document.getElementById('messagesContainer');
+  if (!container) return;
+  
   messageDataStore[msg.id] = msg;
 
   const wrapper = document.createElement('div');
@@ -785,11 +1160,15 @@ function renderMessage(msg) {
   const ticksHTML = isSent ? getTicks(msg.status || 'sent') : '';
   const reactionsHTML = buildReactionsHTML(msg.reactions || {});
   const replyHTML = msg.replyTo ? buildReplyHTML(msg.replyTo) : '';
+  
   const forwardedHTML = msg.forwarded
-    ? `<div style="font-size:11px;color:#888;margin-bottom:3px;"><i class="fa-solid fa-share" style="font-size:10px;"></i> Forwarded</div>`
+    ? `<div style="font-size:11px;color:#888;margin-bottom:3px;">
+        <i class="fa-solid fa-share" style="font-size:10px;"></i> Forwarded
+       </div>`
     : '';
 
   let msgContent = '';
+  
   if (msg.msgType === 'photo' && msg.photo) {
     msgContent = `<img src="${msg.photo}" class="msg-photo" onclick="openPhoto(this.src)" />`;
   } else if (msg.msgType === 'audio' && msg.audio) {
@@ -799,6 +1178,7 @@ function renderMessage(msg) {
     const isDeclined = msg.callStatus === 'declined';
     const iconClass = msg.callType === 'video' ? 'fa-video' : 'fa-phone';
     const color = (isMissed || isDeclined) ? '#e53935' : '#128C7E';
+    
     msgContent = `
       <div class="call-msg-bubble ${isMissed ? 'missed' : ''}">
         <i class="fa-solid ${iconClass}" style="color:${color};"></i>
@@ -835,18 +1215,23 @@ function renderMessage(msg) {
 }
 
 // ─── PHOTO VIEWER ──────────────────────────────────────────
+
 window.openPhoto = function (src) {
-  document.getElementById('photoModalImg').src = src;
-  document.getElementById('photoModal').style.display = 'flex';
+  const modal = document.getElementById('photoModal');
+  const img = document.getElementById('photoModalImg');
+  
+  if (modal && img) {
+    img.src = src;
+    modal.style.display = 'flex';
+  }
 }
 
 window.closePhoto = function () {
-  document.getElementById('photoModal').style.display = 'none';
-  document.getElementById('photoModalImg').src = '';
-}
-
-// ─── SCROLL ────────────────────────────────────────────────
-function scrollToBottom() {
-  const container = document.getElementById('messagesContainer');
-  container.scrollTop = container.scrollHeight;
+  const modal = document.getElementById('photoModal');
+  const img = document.getElementById('photoModalImg');
+  
+  if (modal && img) {
+    modal.style.display = 'none';
+    img.src = '';
+  }
 }

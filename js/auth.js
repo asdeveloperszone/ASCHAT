@@ -6,49 +6,91 @@ import {
   updateProfile,
   onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-auth.js";
-import { ref, set, get } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-database.js";
+import { ref, set, get, runTransaction } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-database.js";
 
 // Check if already logged in
 onAuthStateChanged(auth, async (user) => {
   if (user) {
-    let myID = localStorage.getItem('aschat_userID');
-    if (!myID || myID === 'null') {
-      try {
-        const snapshot = await get(ref(db, 'userMap/' + user.uid));
-        if (snapshot.exists()) {
-          const userID = snapshot.val();
-          const userSnap = await get(ref(db, 'users/' + userID));
-          if (userSnap.exists()) {
-            localStorage.setItem('aschat_userID', userID);
-            localStorage.setItem('aschat_name', userSnap.val().displayName);
-            localStorage.setItem('aschat_uid', user.uid);
-            if (userSnap.val().photoURL) {
-              localStorage.setItem('aschat_photo', userSnap.val().photoURL);
-            }
-          }
-        }
-      } catch (err) {
-        console.error(err);
-      }
+    try {
+      await loadUserData(user);
+      window.location.href = 'chats.html';
+    } catch (err) {
+      console.error('Error loading user:', err);
     }
-    window.location.href = 'chats.html';
   }
 });
 
-// Generate 9-digit unique ID
-function generateUserID() {
-  return Math.floor(100000000 + Math.random() * 900000000).toString();
+async function loadUserData(user) {
+  let myID = localStorage.getItem('aschat_userID');
+  
+  if (!myID || myID === 'null') {
+    // Try to get from userMap
+    const snapshot = await get(ref(db, 'userMap/' + user.uid));
+    if (snapshot.exists()) {
+      myID = snapshot.val();
+      const userSnap = await get(ref(db, 'users/' + myID));
+      if (userSnap.exists()) {
+        const userData = userSnap.val();
+        localStorage.setItem('aschat_userID', myID);
+        localStorage.setItem('aschat_name', userData.displayName);
+        localStorage.setItem('aschat_uid', user.uid);
+        if (userData.photoURL) {
+          localStorage.setItem('aschat_photo', userData.photoURL);
+        }
+      }
+    }
+  }
+}
+
+// Generate unique 9-digit ID
+async function generateUniqueUserID() {
+  let attempts = 0;
+  const maxAttempts = 10;
+  
+  while (attempts < maxAttempts) {
+    // Generate 9-digit number (100000000 to 999999999)
+    const userID = Math.floor(100000000 + Math.random() * 900000000).toString();
+    
+    // Check if ID already exists using transaction
+    try {
+      const result = await runTransaction(ref(db, 'users/' + userID), (currentData) => {
+        if (currentData !== null) {
+          return; // Abort transaction, ID exists
+        }
+        return { _temp: true }; // Temporary placeholder
+      });
+      
+      if (result.committed) {
+        // Remove temporary placeholder
+        await set(ref(db, 'users/' + userID), null);
+        return userID;
+      }
+    } catch (err) {
+      // ID exists, try again
+      attempts++;
+    }
+  }
+  
+  throw new Error('Could not generate unique user ID after ' + maxAttempts + ' attempts');
 }
 
 // Save user to database
-async function saveUserToDB(uid, name, userID, photoURL) {
+async function saveUserToDB(uid, name, photoURL) {
+  const userID = await generateUniqueUserID();
+  
+  // Save user data
   await set(ref(db, 'users/' + userID), {
     displayName: name,
     uid: uid,
     userID: userID,
-    photoURL: photoURL || null
+    photoURL: photoURL || null,
+    createdAt: Date.now()
   });
+  
+  // Save mapping
   await set(ref(db, 'userMap/' + uid), userID);
+  
+  return userID;
 }
 
 // Show Login Form
@@ -84,8 +126,7 @@ window.registerUser = async function () {
     const result = await createUserWithEmailAndPassword(auth, email, password);
     await updateProfile(result.user, { displayName: name });
 
-    const userID = generateUserID();
-    await saveUserToDB(result.user.uid, name, userID, null);
+    const userID = await saveUserToDB(result.user.uid, name, null);
 
     localStorage.setItem('aschat_userID', userID);
     localStorage.setItem('aschat_name', name);
@@ -111,73 +152,58 @@ window.loginUser = async function () {
   try {
     errorMsg.textContent = 'Logging in...';
     const result = await signInWithEmailAndPassword(auth, email, password);
-    const uid = result.user.uid;
-
-    const snapshot = await get(ref(db, 'userMap/' + uid));
-    if (snapshot.exists()) {
-      const userID = snapshot.val();
-      const userSnap = await get(ref(db, 'users/' + userID));
-      if (userSnap.exists()) {
-        const data = userSnap.val();
-        localStorage.setItem('aschat_userID', userID);
-        localStorage.setItem('aschat_name', data.displayName);
-        localStorage.setItem('aschat_uid', uid);
-        if (data.photoURL) {
-          localStorage.setItem('aschat_photo', data.photoURL);
-        }
-      }
-    }
-
+    await loadUserData(result.user);
     window.location.href = 'chats.html';
   } catch (err) {
     errorMsg.textContent = err.message;
   }
 }
 
-// Login with Google popup
+// Login with Google
 window.loginWithGoogle = async function () {
   const errorMsg = document.getElementById('authError');
+  
   try {
     errorMsg.textContent = 'Opening Google sign in...';
     const result = await signInWithPopup(auth, googleProvider);
     const user = result.user;
 
     errorMsg.textContent = 'Setting up account...';
+    
+    // Check if user exists in userMap
     const snapshot = await get(ref(db, 'userMap/' + user.uid));
+    let userID;
 
     if (snapshot.exists()) {
       // Existing user
-      const userID = snapshot.val();
+      userID = snapshot.val();
+      
+      // Update photo if needed
       const userSnap = await get(ref(db, 'users/' + userID));
-      if (userSnap.exists()) {
-        const data = userSnap.val();
-        localStorage.setItem('aschat_userID', userID);
-        localStorage.setItem('aschat_name', data.displayName);
-        localStorage.setItem('aschat_uid', user.uid);
-
-        // Always update photo from Google if user hasn't set custom one
-        if (!data.photoURL && user.photoURL) {
-          // Save Google photo to Firebase
-          await set(ref(db, 'users/' + userID + '/photoURL'), user.photoURL);
-          localStorage.setItem('aschat_photo', user.photoURL);
-        } else if (data.photoURL) {
-          localStorage.setItem('aschat_photo', data.photoURL);
-        }
+      if (userSnap.exists() && !userSnap.val().photoURL && user.photoURL) {
+        await set(ref(db, 'users/' + userID + '/photoURL'), user.photoURL);
       }
     } else {
-      // New Google user
-      const userID = generateUserID();
-      await saveUserToDB(user.uid, user.displayName, userID, user.photoURL || null);
+      // New Google user - generate unique ID
+      errorMsg.textContent = 'Creating your unique 9-digit ID...';
+      userID = await saveUserToDB(user.uid, user.displayName, user.photoURL);
+    }
+
+    // Load user data into localStorage
+    const userSnap = await get(ref(db, 'users/' + userID));
+    if (userSnap.exists()) {
+      const userData = userSnap.val();
       localStorage.setItem('aschat_userID', userID);
-      localStorage.setItem('aschat_name', user.displayName);
+      localStorage.setItem('aschat_name', userData.displayName);
       localStorage.setItem('aschat_uid', user.uid);
-      if (user.photoURL) {
-        localStorage.setItem('aschat_photo', user.photoURL);
+      if (userData.photoURL) {
+        localStorage.setItem('aschat_photo', userData.photoURL);
       }
     }
 
     window.location.href = 'chats.html';
   } catch (err) {
-    errorMsg.textContent = err.message;
+    console.error('Google login error:', err);
+    errorMsg.textContent = err.message || 'Failed to sign in with Google';
   }
-}
+    }
